@@ -340,7 +340,7 @@ def get_Gemini_response(instruction, system_prompt, temperature=0.0):
 
 def stream_out(output):
     CHUNK_SIZE = int(round(len(output) / 50))
-    SLEEP_TIME = 0.1
+    SLEEP_TIME = 0.001
     for i in range(0, len(output), CHUNK_SIZE):
         print(output[i : i + CHUNK_SIZE], end="")
         sys.stdout.flush()
@@ -383,7 +383,11 @@ def disease_entity_extractor(text):
 
 
 def disease_entity_extractor_v2(text, model_id):
-    assert model_id in ("gemini-2.0-flash")
+    assert model_id in [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-lite",
+    ]
     prompt_updated = (
         system_prompts["DISEASE_ENTITY_EXTRACTION"] + "\n" + "Sentence : " + text
     )
@@ -421,6 +425,7 @@ def retrieve_context(
     edge_evidence,
     model_id="gpt-3.5-turbo",
     api=False,
+    mode_4=False,
 ):
     print("question:", question)
     entities = disease_entity_extractor_v2(question, model_id)
@@ -435,6 +440,7 @@ def retrieve_context(
             node_hits.append(node_search_result[0][0].page_content)
         question_embedding = embedding_function.embed_query(question)
         node_context_extracted = ""
+        print("hi   1")
         for node_name in node_hits:
             if not api:
                 node_context = node_context_df[
@@ -493,10 +499,33 @@ def retrieve_context(
                     + context_table.evidence.astype("str")
                     + "\n\n"
                 )
+                print("edge, entities", context_table)
                 node_context_extracted += context_table.context.str.cat(sep=" ")
+                if mode_4:
+                    raise Exception(
+                        "i dont expect this to happen here, context is {}".format(
+                            node_context_extracted
+                        )
+                    )
             else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
+                print("no edge, entities", high_similarity_context)
+                if not mode_4:
+                    node_context_extracted += ". ".join(high_similarity_context)
+                    node_context_extracted += ". "
+                    return node_context_extracted
+                genes_in_the_question = [
+                    z.strip() for z in question.split("Given list is: ")[1].split(",")
+                ]
+                print("GENES WE HAVE IN THE QUESTION:", genes_in_the_question)
+                new_high_similarity_context = []
+                # MODE 4: Filter context to only include those with genes mentioned in the question
+                for c in high_similarity_context:
+                    if any(gene in c for gene in genes_in_the_question):
+                        new_high_similarity_context.append(c)
+                    else:
+                        print("QUESTION:", question, " WE ARE SKIPPING CONTEXT:", c)
+                print("NEW HIGH SIMILARITY CONTEXT:", new_high_similarity_context)
+                node_context_extracted += ". ".join(new_high_similarity_context)
         return node_context_extracted
     else:
         node_hits = vectorstore.similarity_search_with_score(question, k=5)
@@ -562,11 +591,246 @@ def retrieve_context(
                     + context_table.evidence.astype("str")
                     + "\n\n"
                 )
+                print("edge, no entities", context_table)
                 node_context_extracted += context_table.context.str.cat(sep=" ")
+                if mode_4:
+                    raise Exception(
+                        "i dont expect this to happen here, context is {}".format(
+                            node_context_extracted
+                        )
+                    )
             else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
+                print("no edge, entities", high_similarity_context)
+                if not mode_4:
+                    node_context_extracted += ". ".join(high_similarity_context)
+                    node_context_extracted += ". "
+                    return node_context_extracted
+                genes_in_the_question = question.split("Given list is: ")[1].split(",")
+                print("GENES WE HAVE IN THE QUESTION:", genes_in_the_question)
+                new_high_similarity_context = []
+                # MODE 4: Filter context to only include those with genes mentioned in the question
+                for c in high_similarity_context:
+                    if any(gene in c for gene in genes_in_the_question):
+                        new_high_similarity_context.append(c)
+                    else:
+                        print("QUESTION:", question, " WE ARE SKIPPING CONTEXT:", c)
+                print("NEW HIGH SIMILARITY CONTEXT:", new_high_similarity_context)
+                node_context_extracted += ". ".join(new_high_similarity_context)
         return node_context_extracted
+
+        # {
+        #   "statement": "Disease psoriasis associates Gene HLA-B."
+        # },
+        # {
+        #   "statement": "Variant rs13203895 x rs4349859 associates Disease psoriasis."
+        # },
+
+
+def extract_gene_from_statement(statement):
+    if statement[-1] == ".":
+        statement = statement[:-1]
+    if "associates Gene" in statement:
+        return statement.split("associates Gene ")[1]
+    if "Variant" in statement:
+        return statement.split("Variant ")[1].split(" associates Disease")[0]
+    if "Gene" in statement:
+        return statement.split("Gene ")[1].split(" associates Disease")[0]
+    raise ValueError(f"Statement {statement} does not contain a gene association.")
+
+
+def retrieve_context_json(
+    question,
+    vectorstore,
+    embedding_function,
+    node_context_df,
+    context_volume,
+    context_sim_threshold,
+    context_sim_min_threshold,
+    edge_evidence,
+    model_id="gpt-3.5-turbo",
+    api=False,
+):
+    """Return the retrieved context as a JSON string rather than a concatenated natural-language paragraph."""
+
+    def _ensure_sentence_ending(sentence):
+        sentence = sentence.strip()
+        if not sentence:
+            return sentence
+        return sentence if sentence.endswith(".") else sentence + "."
+
+    def _sanitize_value(value):
+        if isinstance(value, (np.generic,)):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+        return value
+
+    print("question:", question)
+    entities = disease_entity_extractor_v2(question, model_id)
+    print("entities:", entities)
+    node_hits = []
+    retrieval_payload = {
+        "diseases": [],
+    }
+    evidence_enabled = edge_evidence and api
+    if entities:
+        max_number_of_high_similarity_context_per_node = int(
+            context_volume / len(entities)
+        )
+        for entity in entities:
+            node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
+            node_hits.append(node_search_result[0][0].page_content)
+        question_embedding = embedding_function.embed_query(question)
+        for node_name in node_hits:
+            if not api:
+                node_context = node_context_df[
+                    node_context_df.node_name == node_name
+                ].node_context.values[0]
+            else:
+                node_context, context_table = get_context_using_spoke_api(node_name)
+            node_context_list = node_context.split(". ")
+            node_context_embeddings = embedding_function.embed_documents(
+                node_context_list
+            )
+            similarities = [
+                cosine_similarity(
+                    np.array(question_embedding).reshape(1, -1),
+                    np.array(node_context_embedding).reshape(1, -1),
+                )
+                for node_context_embedding in node_context_embeddings
+            ]
+            similarities = sorted(
+                [(e, i) for i, e in enumerate(similarities)], reverse=True
+            )
+            percentile_threshold = np.percentile(
+                [s[0] for s in similarities], context_sim_threshold
+            )
+            high_similarity_indices = [
+                s[1]
+                for s in similarities
+                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
+            ]
+            if (
+                len(high_similarity_indices)
+                > max_number_of_high_similarity_context_per_node
+            ):
+                high_similarity_indices = high_similarity_indices[
+                    :max_number_of_high_similarity_context_per_node
+                ]
+            high_similarity_context = [
+                node_context_list[index] for index in high_similarity_indices
+            ]
+            node_entry = {node_name: []}
+            normalized_context = [
+                _ensure_sentence_ending(ctx) for ctx in high_similarity_context
+            ]
+            if evidence_enabled:
+                filtered_context = normalized_context
+                context_table_filtered = context_table[
+                    context_table.context.isin(filtered_context)
+                ].copy()
+                for record in context_table_filtered.to_dict(orient="records"):
+                    context_item = {
+                        "statement": (record.get("context", "")),
+                        # "source": _sanitize_value(record.get("source")),
+                        # "predicate": _sanitize_value(record.get("predicate")),
+                        # "target": _sanitize_value(record.get("target")),
+                        "provenance": _sanitize_value(record.get("provenance")),
+                    }
+                    evidence_value = _sanitize_value(record.get("evidence"))
+                    if evidence_value is not None:
+                        context_item["evidence"] = evidence_value
+                    node_entry[node_name].append(
+                        {k: v for k, v in context_item.items() if v is not None}
+                    )
+            else:
+                node_entry[node_name] = [
+                    {"statement": (sentence)}
+                    for sentence in normalized_context
+                    if sentence
+                ]
+            retrieval_payload["diseases"].append(node_entry)
+        return json.dumps(retrieval_payload, indent=2, default=str)
+    else:
+        node_hits = vectorstore.similarity_search_with_score(question, k=5)
+        max_number_of_high_similarity_context_per_node = int(context_volume / 5)
+        question_embedding = embedding_function.embed_query(question)
+        for node in node_hits:
+            node_name = node[0].page_content
+            if not api:
+                node_context = node_context_df[
+                    node_context_df.node_name == node_name
+                ].node_context.values[0]
+            else:
+                node_context, context_table = get_context_using_spoke_api(node_name)
+            node_context_list = node_context.split(". ")
+            node_context_embeddings = embedding_function.embed_documents(
+                node_context_list
+            )
+            similarities = [
+                cosine_similarity(
+                    np.array(question_embedding).reshape(1, -1),
+                    np.array(node_context_embedding).reshape(1, -1),
+                )
+                for node_context_embedding in node_context_embeddings
+            ]
+            similarities = sorted(
+                [(e, i) for i, e in enumerate(similarities)], reverse=True
+            )
+            percentile_threshold = np.percentile(
+                [s[0] for s in similarities], context_sim_threshold
+            )
+            high_similarity_indices = [
+                s[1]
+                for s in similarities
+                if s[0] > percentile_threshold and s[0] > context_sim_min_threshold
+            ]
+            if (
+                len(high_similarity_indices)
+                > max_number_of_high_similarity_context_per_node
+            ):
+                high_similarity_indices = high_similarity_indices[
+                    :max_number_of_high_similarity_context_per_node
+                ]
+            high_similarity_context = [
+                node_context_list[index] for index in high_similarity_indices
+            ]
+            node_entry = {node_name: []}
+            normalized_context = [
+                _ensure_sentence_ending(ctx) for ctx in high_similarity_context
+            ]
+            if evidence_enabled:
+                filtered_context = normalized_context
+                context_table_filtered = context_table[
+                    context_table.context.isin(filtered_context)
+                ].copy()
+                for record in context_table_filtered.to_dict(orient="records"):
+                    context_item = {
+                        "statement": (record.get("context", "")),
+                        # "source": _sanitize_value(record.get("source")),
+                        # "predicate": _sanitize_value(record.get("predicate")),
+                        # "target": _sanitize_value(record.get("target")),
+                        "provenance": _sanitize_value(record.get("provenance")),
+                    }
+                    evidence_value = _sanitize_value(record.get("evidence"))
+                    if evidence_value is not None:
+                        context_item["evidence"] = evidence_value
+                    node_entry["context"].append(
+                        {k: v for k, v in context_item.items() if v is not None}
+                    )
+            else:
+                node_entry[node_name] = [
+                    {"statement": (sentence)}
+                    for sentence in normalized_context
+                    if sentence
+                ]
+            retrieval_payload["diseases"].append(node_entry)
+        return json.dumps(retrieval_payload, indent=2, default=str)
 
 
 def interactive(

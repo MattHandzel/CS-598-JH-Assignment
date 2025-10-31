@@ -1,0 +1,2 @@
+- Provenance & Symptoms information is useless.
+- Similar diseases tend to have similar gene associations.
